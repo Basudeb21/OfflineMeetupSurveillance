@@ -1,21 +1,25 @@
 import re
 import spacy
-import os
-import time
 import pytesseract
+import redis
+import json
 from PIL import Image
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-import threading
+import requests
+from io import BytesIO
 
-pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"  # Mac
-# pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"  # Windows
+r = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+REDIS_QUEUE = "moderation_text_queue"
 
+# pytesseract for Windows
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# Load SpaCy model
 nlp = spacy.load("en_core_web_sm")
 
+# Regex rules
 email_pattern = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b')
 url_pattern = re.compile(r'(https?:\/\/[^\s]+|www\.[^\s]+|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:\/[^\s]*)?)')
-phone_pattern = re.compile(r'\+?\d[\d\s\-()]{7,}\d') 
+phone_pattern = re.compile(r'\+?\d[\d\s\-()]{7,}\d')
 
 PLATFORM_DOMAIN = "myvault-web.codextechnolife.com"
 
@@ -25,7 +29,6 @@ number_words = {
     "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty",
     "sixty", "seventy", "eighty", "ninety", "hundred", "thousand", "million", "billion"
 }
-
 
 def isEmail(text: str) -> bool:
     return bool(email_pattern.search(text))
@@ -63,82 +66,50 @@ def hasAddress(text: str) -> bool:
     return False
 
 def isPersonalDetails(text: str) -> bool:
-    if hasForbiddenURL(text):
-        return True
-    if isEmail(text):
-        return True
-    if hasPhoneNumber(text):
-        return True
-    if hasNumberWords(text):
-        return True
-    if hasNumber(text):
-        return True
-    if hasAddress(text):
-        return True
-    return False
+    return any([
+        hasForbiddenURL(text),
+        isEmail(text),
+        hasPhoneNumber(text),
+        hasNumberWords(text),
+        hasNumber(text),
+        hasAddress(text)
+    ])
 
-# -------------------------
-# OCR & Folder Watcher
-# -------------------------
-WATCH_FOLDER = "files_to_check"
-
-class FileHandler(FileSystemEventHandler):
-    def on_created(self, event):
-        if event.is_directory:
-            return
-        filepath = event.src_path
-        print(f"\n📂 New file detected: {filepath}")
-        
-        if filepath.lower().endswith((".png", ".jpg", ".jpeg", ".tiff")):
-            text = extract_text_from_image(filepath)
-            print(f"📝 OCR Extracted Text:\n{text}")
-            
-            if isPersonalDetails(text):
-                print("⚠️ Personal details detected in image!")
-            else:
-                print("✅ No personal details found in image.")
-        else:
-            print("❌ File type not supported for OCR")
-
-def extract_text_from_image(filepath: str) -> str:
+def extract_text_from_file(file_path_or_url: str) -> str:
     try:
-        img = Image.open(filepath)
-        text = pytesseract.image_to_string(img)
-        return text
+        # If file_path_or_url is a URL, download it
+        if file_path_or_url.startswith("http"):
+            response = requests.get(file_path_or_url)
+            img = Image.open(BytesIO(response.content))
+        else:
+            img = Image.open(file_path_or_url)
+        return pytesseract.image_to_string(img)
     except Exception as e:
         print(f"Error in OCR: {e}")
         return ""
 
-def start_watching(folder: str):
-    event_handler = FileHandler()
-    observer = Observer()
-    observer.schedule(event_handler, folder, recursive=False)
-    observer.start()
-    print(f"👀 Watching folder: {folder}")
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        observer.stop()
-    observer.join()
+def process_redis_messages():
+    print("Listening to Redis queue...")
+    while True:
+        _, message = r.blpop(REDIS_QUEUE)
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError:
+            print("Invalid JSON:", message)
+            continue
 
+        # If there's an image/file path, run OCR
+        text_to_check = data.get("text", "")
+        if "filename" in data:
+            text_to_check += " " + extract_text_from_file(data["filename"])
+
+        # Check personal details
+        result = isPersonalDetails(text_to_check)
+        data["is_personal_details_detected"] = result
+
+        # Print the final data
+        print(f"\n Redis Data Processed: {json.dumps(data, indent=2)}")
+        print(f" Personal Details Detected: {result}\n")
 
 if __name__ == "__main__":
-    if not os.path.exists(WATCH_FOLDER):
-        os.makedirs(WATCH_FOLDER)
-
-    watcher_thread = threading.Thread(target=start_watching, args=(WATCH_FOLDER,), daemon=True)
-    watcher_thread.start()
-
-    print("✅ Personal Details Detector is running.")
-    print("Type any text to check, or Ctrl+C to exit.\n")
-
-    try:
-        while True:
-            user_input = input("Enter text to check: ").strip()
-            if not user_input:
-                continue
-            result = isPersonalDetails(user_input)
-            print(f"Result: {result}\n")
-    except KeyboardInterrupt:
-        print("\nExiting...")
+    process_redis_messages()
